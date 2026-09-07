@@ -31,7 +31,8 @@ config.json 只有 3 个字段。零第三方依赖(纯 Go 标准库)。
 > client_id `b1a00492-...`,请求头带 `x-grok-client-version` / `X-XAI-Token-Auth`
 > 等,grok CLI 更新后如需同步改 `main.go` 顶部的常量即可。
 
-路由固定为 `/grok/...`。
+路由为根路径 `/`:**所有路径原样透传到上游**——直接按 OpenAI 兼容格式调用,
+不需要 `/grok` 之类的前缀。
 
 ## 运行
 
@@ -46,15 +47,15 @@ go build -o grok-proxy .
 ## 客户端调用示例
 
 ```bash
-curl -X POST http://127.0.0.1:5001/grok/v1/chat/completions \
+curl -X POST http://127.0.0.1:5001/v1/chat/completions \
   -H "Authorization: Bearer sk-local-fixed" \
   -H "Content-Type: application/json" \
-  -d '{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"grok-4.6","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## Docker / docker-compose (NAS)
 
-镜像发布在 GitHub Container Registry: `ghcr.io/myflv/grok2api`(支持 amd64 / arm64)。
+镜像发布在 GitHub Container Registry: `ghcr.io/myflv/grok-api`(支持 amd64 / arm64)。
 
 1. 准备目录,放入 `config.json`(见上,`cred_file` 为 `/data/grok-auth.json`)和 `docker-compose.yml`;
 2. 启动:
@@ -74,16 +75,16 @@ curl -X POST http://127.0.0.1:5001/grok/v1/chat/completions \
    授权成功后凭证持久化在 `./data/`,之后重启容器自动复用并后台刷新
    (除非 refresh_token 被吊销 —— 删掉 `./data/grok-auth.json` 重启重新登录即可)。
 
-4. 调用:`http://<NAS_IP>:5001/grok/v1/chat/completions`(带 `Authorization: Bearer <api_key>`)。
+4. 调用:`http://<NAS_IP>:5001/v1/chat/completions`(带 `Authorization: Bearer <api_key>`)。
 
 ## 与 llm-proxy 配合
 
 ```yaml
-- name: grok-4.5
+- name: grok-4.6
   type: responses
-  model: grok-4.5
+  model: grok-4.6
   api_key: sk-local-fixed
-  base_url: http://127.0.0.1:5001/grok/v1
+  base_url: http://127.0.0.1:5001/v1
 ```
 
 ## 从 oauth-proxy 迁移

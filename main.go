@@ -35,8 +35,7 @@ import (
 // ---------- grok 内置参数(与官方 grok-build 对齐,一般不用改) ----------
 
 const (
-	logTag      = "grok" // 日志标签 + 路由前缀
-	routePrefix = "/grok"
+	logTag = "grok" // 日志标签
 
 	upstreamBase  = "https://cli-chat-proxy.grok.com"      // 上游 API
 	oauthTokenURL = "https://auth.x.ai/oauth2/token"       // token 端点(刷新/轮询)
@@ -503,14 +502,14 @@ func grokHeaders() map[string]string {
 	}
 }
 
-// buildProxy 创建反向代理: 注入新鲜 Bearer + grok 静态头。
+// buildProxy 创建反向代理: 根路径透传,注入新鲜 Bearer + grok 静态头。
 func (a *App) buildProxy() {
 	target := upstreamTarget
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
+			// 只改 scheme/host,路径原样透传(如 /v1/chat/completions)
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-			req.URL.Path = strings.TrimPrefix(req.URL.Path, routePrefix)
 			req.Host = target.Host
 
 			// serve 已保证 ready(access_token 非空),这里只负责注入
@@ -529,7 +528,7 @@ func (a *App) buildProxy() {
 	a.proxy = rp
 }
 
-// serve 处理 /grok/... 请求: 未就绪返回 503,就绪则转发。
+// serve 处理代理请求: 未就绪返回 503,就绪则转发。
 func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 	ready, authErr := a.authStatus()
 	if !ready {
@@ -660,7 +659,7 @@ func main() {
 		}
 		writeJSON(w, code, map[string]interface{}{"ok": ready, logTag: status})
 	})
-	mux.HandleFunc(routePrefix+"/", a.serve)
+	mux.HandleFunc("/", a.serve)
 
 	if forceLogin {
 		// 强制登录模式: 登录成功后退出
@@ -678,8 +677,8 @@ func main() {
 	if listen == "" {
 		listen = defaultListen
 	}
-	log.Printf("grok-proxy listening on %s; route %s/ -> %s (grok client v%s, auth in background)",
-		listen, routePrefix, upstreamBase, grokClientVersion)
+	log.Printf("grok-proxy listening on %s; -> %s (grok client v%s, auth in background)",
+		listen, upstreamBase, grokClientVersion)
 	go a.run(context.Background())
 	log.Fatal(http.ListenAndServe(listen, handler))
 }
