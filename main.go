@@ -35,8 +35,8 @@ const (
 	oauthScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 	oauthReferrer = "grok-build"
 
-	// 可用 GROK_CLIENT_VERSION 覆盖。
-	defaultClientVersion = "1.0.13"
+	// grok 客户端版本(与下方请求头/UA 一起同步升级)
+	grokClientVersion = "1.0.13"
 
 	defaultListen   = ":8080"
 	defaultCredFile = "grok-auth.json"
@@ -49,8 +49,6 @@ const (
 	ttlFallbackSec      = 3600 // 上游没给 ttl 时的兜底(1 小时)
 	loginTimeout        = 10 * time.Minute
 )
-
-var grokClientVersion = defaultClientVersion
 
 // upstreamTarget 是编译期常量 URL 的解析结果(不可能失败)。
 var upstreamTarget = func() *url.URL {
@@ -604,9 +602,6 @@ func main() {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
-	}
-	if v := os.Getenv("GROK_CLIENT_VERSION"); v != "" {
-		grokClientVersion = v
 	}
 
 	a := &App{
