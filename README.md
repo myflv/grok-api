@@ -54,7 +54,7 @@ curl -X POST http://127.0.0.1:5001/grok/v1/chat/completions \
 
 ## Docker / docker-compose (NAS)
 
-镜像发布在 GitHub Container Registry: `ghcr.io/myflavor/grok-proxy`(支持 amd64 / arm64)。
+镜像发布在 GitHub Container Registry: `ghcr.io/myflv/grok2api`(支持 amd64 / arm64)。
 
 1. 准备目录,放入 `config.json`(见上,`cred_file` 为 `/data/grok-auth.json`)和 `docker-compose.yml`;
 2. 启动:
