@@ -12,5 +12,5 @@ services:
       # - GROK_CLIENT_VERSION=1.0.13
     volumes:
       - ./config.json:/app/config.json:ro   # 挂载配置(只读)
-      - ./data:/data                          # 凭证持久化(grok.json 存这里)
+      - ./data:/data                          # 凭证持久化(grok-auth.json 存这里)
     # 首次登录: docker compose logs -f grok-proxy 查看授权 URL,浏览器授权后自动完成

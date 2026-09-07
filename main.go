@@ -2,12 +2,12 @@
 //
 // 与通用 oauth-proxy 的区别:
 //   - 只有一个上游 grok: URL / client_id / scope / 请求头全部内置写死,
-//     config.json 只需关心 listen / client_api_key / name / cred_dir。
-//   - 凭证存到 <cred_dir>/<name>.json(如 /data/grok.json)。
+//     config.json 只需关心 listen / api_key / cred_file 三个字段。
+//   - 凭证存到单个文件 cred_file(如 /data/grok-auth.json)。
 //
 // 工作方式:
 //
-//	客户端 --(固定 client_api_key)--> grok-proxy --(自动刷新的 Bearer)--> cli-chat-proxy
+//	客户端 --(固定 api_key)--> grok-proxy --(自动刷新的 Bearer)--> cli-chat-proxy
 //	代理自己维护 OAuth2 token: 首次 device code 登录,过期前 300s 自动刷新,
 //	处理 refresh token 轮换并落盘;转发时自动带上 grok 要求的全套请求头。
 package main
@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -51,17 +52,18 @@ var grokClientVersion = defaultClientVersion
 
 // ---------- 配置 ----------
 
+const defaultName = "grok" // 路由前缀 /grok/... 与日志标签(不需要配置)
+
 type Config struct {
-	Listen       string `json:"listen"`         // 监听地址,默认 ":8080"
-	ClientAPIKey string `json:"client_api_key"` // 客户端访问用的固定 key(空则不校验)
-	Name         string `json:"name"`           // 路由前缀 + 凭证文件名,默认 "grok"
-	CredDir      string `json:"cred_dir"`       // 凭证目录,默认 "./data"
+	Listen   string `json:"listen"`    // 监听地址,默认 ":8080"
+	APIKey   string `json:"api_key"`   // 客户端访问用的固定 key(空则不校验)
+	CredFile string `json:"cred_file"` // 凭证文件路径,默认 "grok-auth.json"
 }
 
 // App 是单个 grok 上游的全部运行时状态。
 type App struct {
 	cfg      *Config
-	name     string
+	name     string // 固定 defaultName,用于路由与日志
 	credPath string
 	proxy    *httputil.ReverseProxy
 
@@ -104,17 +106,18 @@ var oauthHTTPClient = &http.Client{Timeout: oauthHTTPTimeoutSec * time.Second}
 
 // ---------- 凭证读写 ----------
 
-// resolveCredPath 返回凭证路径 <cred_dir>/<name>.json。
+// resolveCredPath 返回凭证路径:配置的 cred_file,缺省 "grok-auth.json"。
 func (a *App) resolveCredPath() {
-	dir := a.cfg.CredDir
-	if dir == "" {
-		dir = "./data"
+	p := a.cfg.CredFile
+	if p == "" {
+		p = "grok-auth.json"
 	}
-	dir = expandHome(dir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Printf("[%s] warn: mkdir cred dir: %v", a.name, err)
+	a.credPath = expandHome(p)
+	if dir := filepath.Dir(a.credPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Printf("[%s] warn: mkdir cred dir: %v", a.name, err)
+		}
 	}
-	a.credPath = dir + "/" + a.name + ".json"
 }
 
 // loadCred 从凭证文件载入 access/refresh/expiry。返回是否成功载入。
@@ -630,7 +633,7 @@ func main() {
 		grokClientVersion = v
 	}
 
-	a := &App{cfg: cfg, name: cfg.Name}
+	a := &App{cfg: cfg, name: defaultName}
 	a.resolveCredPath()
 	if err := a.buildProxy(); err != nil {
 		log.Fatalf("%v", err)
@@ -664,7 +667,7 @@ func main() {
 		return
 	}
 
-	handler := authMiddleware(cfg.ClientAPIKey, mux)
+	handler := authMiddleware(cfg.APIKey, mux)
 	listen := cfg.Listen
 	if listen == "" {
 		listen = ":8080"
@@ -686,9 +689,6 @@ func loadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
-	}
-	if cfg.Name == "" {
-		cfg.Name = "grok"
 	}
 	return &cfg, nil
 }

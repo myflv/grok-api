@@ -1,6 +1,5 @@
 {
   "listen": "0.0.0.0:8080",
-  "client_api_key": "sk-local-fixed",
-  "name": "grok",
-  "cred_dir": "/data"
+  "api_key": "sk-local-fixed",
+  "cred_file": "/data/grok-auth.json"
 }
