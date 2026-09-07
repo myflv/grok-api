@@ -1,15 +1,6 @@
-// grok-proxy: 面向 grok(SuperGrok/X Premium 订阅)的极简 OAuth2 反向代理。
-//
-// 与通用 oauth-proxy 的区别:
-//   - 只有一个上游 grok: URL / client_id / scope / 请求头全部内置写死,
-//     config.json 只需关心 listen / api_key / cred_file 三个字段。
-//   - 凭证存到单个文件 cred_file(如 /data/grok-auth.json)。
-//
-// 工作方式:
-//
-//	客户端 --(固定 api_key)--> grok-proxy --(自动刷新的 Bearer)--> cli-chat-proxy
-//	代理自己维护 OAuth2 token: 首次 device code 登录,过期前 300s 自动刷新,
-//	处理 refresh token 轮换并落盘;转发时自动带上 grok 要求的全套请求头。
+// grok-proxy: 面向 grok 订阅的极简 OAuth2 反向代理。客户端只用一个固定 api_key,
+// 代理自动维护 grok 的 OAuth2 token(device-code 登录、过期自动刷新、轮换落盘),
+// 并转发到 cli-chat-proxy。config.json 只有 listen / api_key / cred_file 三个字段。
 package main
 
 import (
@@ -32,34 +23,33 @@ import (
 	"time"
 )
 
-// ---------- grok 内置参数(与官方 grok-build 对齐,一般不用改) ----------
+// ---------- grok 内置参数 ----------
 
 const (
-	logTag = "grok" // 日志标签
+	logTag = "grok"
 
-	upstreamBase  = "https://cli-chat-proxy.grok.com"      // 上游 API
-	oauthTokenURL = "https://auth.x.ai/oauth2/token"       // token 端点(刷新/轮询)
-	oauthDevURL   = "https://auth.x.ai/oauth2/device/code" // device code 端点
+	upstreamBase  = "https://cli-chat-proxy.grok.com"
+	oauthTokenURL = "https://auth.x.ai/oauth2/token"
+	oauthDevURL   = "https://auth.x.ai/oauth2/device/code"
 	oauthClientID = "b1a00492-073a-47ea-816f-4c329264a828"
 	oauthScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 	oauthReferrer = "grok-build"
 
-	// grok CLI 版本号,请求头会带它。可用环境变量 GROK_CLIENT_VERSION 覆盖。
+	// 可用 GROK_CLIENT_VERSION 覆盖。
 	defaultClientVersion = "1.0.13"
 
 	defaultListen   = ":8080"
 	defaultCredFile = "grok-auth.json"
 
-	refreshSkewSec      = 300 // 过期前多少秒提前刷新
-	refreshTimeoutSec   = 30  // 单次刷新请求的超时
-	retryDelaySec       = 60  // 鉴权失败后的重试间隔
-	oauthHTTPTimeoutSec = 60  // OAuth 单次请求超时
-	devicePollInterval  = 5   // device code 轮询间隔(秒)
-	ttlFallbackSec      = 3600
+	refreshSkewSec      = 300
+	refreshTimeoutSec   = 30
+	retryDelaySec       = 60
+	oauthHTTPTimeoutSec = 60
+	devicePollInterval  = 5
+	ttlFallbackSec      = 3600 // 上游没给 ttl 时的兜底(1 小时)
 	loginTimeout        = 10 * time.Minute
 )
 
-// grokClientVersion 是发到上游的 x-grok-client-version 值。
 var grokClientVersion = defaultClientVersion
 
 // upstreamTarget 是编译期常量 URL 的解析结果(不可能失败)。
@@ -74,15 +64,15 @@ var upstreamTarget = func() *url.URL {
 // ---------- 配置 ----------
 
 type Config struct {
-	Listen   string `json:"listen"`    // 监听地址,默认 ":8080"
-	APIKey   string `json:"api_key"`   // 客户端访问用的固定 key(空则不校验)
-	CredFile string `json:"cred_file"` // 凭证文件路径,默认 "grok-auth.json"
+	Listen   string `json:"listen"`    // 默认 :8080
+	APIKey   string `json:"api_key"`   // 客户端访问 key(空则不校验)
+	CredFile string `json:"cred_file"` // 默认 grok-auth.json
 }
 
-// App 是单个 grok 上游的全部运行时状态。
+// App 持有代理的全部运行时状态。
 type App struct {
 	credPath string
-	headers  map[string]string // 转发时附加的静态头(启动时构造一次)
+	headers  map[string]string // 转发时附加的静态头
 	proxy    *httputil.ReverseProxy
 
 	refreshMu    sync.Mutex // 串行化刷新:refresh_token 不能并发使用
@@ -90,25 +80,24 @@ type App struct {
 	accessToken  string
 	refreshToken string
 	expiresAt    time.Time
-	ready        bool   // 是否已拿到可用 access_token
+	ready        bool   // 已拿到可用 access_token
 	authErr      string // 最近一次鉴权失败原因
 }
 
-// credFileData 是落盘凭证格式。与 oauth-proxy 的 cred 文件兼容,可直接改名复用。
+// credFileData 是落盘凭证格式。
 type credFileData struct {
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
-// tokenResponse 是 OAuth token 端点标准响应(未用的字段交给 json 忽略)。
+// tokenResponse 是 token 端点响应。
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	ExpiresIn    int    `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"` // 若返回则说明轮换
 }
 
-// deviceCodeResponse 是 device code 端点响应。
 type deviceCodeResponse struct {
 	DeviceCode              string `json:"device_code"`
 	UserCode                string `json:"user_code"`
@@ -118,12 +107,11 @@ type deviceCodeResponse struct {
 	Interval                int    `json:"interval"`
 }
 
-// oauthHTTPClient 只用于 OAuth 请求(刷新/轮询/device code),不含流式转发。
 var oauthHTTPClient = &http.Client{Timeout: oauthHTTPTimeoutSec * time.Second}
 
 // ---------- 凭证读写 ----------
 
-// credPath 返回凭证文件路径:配置的 cred_file,缺省 "grok-auth.json"。
+// credPath 解析凭证路径(展开 ~、建目录)。
 func credPath(credFile string) string {
 	p := credFile
 	if p == "" {
@@ -138,11 +126,11 @@ func credPath(credFile string) string {
 	return p
 }
 
-// loadCred 从凭证文件载入 access/refresh/expiry。返回是否成功载入。
+// loadCred 尝试载入凭证文件。
 func (a *App) loadCred() bool {
 	data, err := os.ReadFile(a.credPath)
 	if err != nil {
-		return false // 文件不存在 → 需要登录
+		return false
 	}
 	var c credFileData
 	if json.Unmarshal(data, &c) != nil || c.RefreshToken == "" {
@@ -157,7 +145,7 @@ func (a *App) loadCred() bool {
 	return true
 }
 
-// saveCred 把当前凭证写回文件(轮换/登录后必须持久化)。调用者须持有 a.mu。
+// saveCred 写回凭证文件。调用者须持有 a.mu。
 func (a *App) saveCred() {
 	data, _ := json.MarshalIndent(credFileData{
 		AccessToken:  a.accessToken,
@@ -177,7 +165,7 @@ func (a *App) token() string {
 	return a.accessToken
 }
 
-// authStatus 返回 (ready, errMsg)。ready 只由 applyToken 置真,且与 access_token 同锁写入。
+// authStatus 返回 (ready, errMsg)。
 func (a *App) authStatus() (bool, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -192,7 +180,7 @@ func (a *App) setAuthErr(msg string) {
 }
 
 // forceRefresh 无条件刷新一次(启动验证 / 定时 / 401 兜底共用)。
-// 网络/5xx 等瞬时失败返回普通错误;refresh_token 被服务端拒绝返回 errCredInvalid。
+// 瞬时失败(网络/5xx)返回普通错误;refresh_token 被拒返回 errCredInvalid。
 func (a *App) forceRefresh(ctx context.Context) error {
 	a.refreshMu.Lock()
 	defer a.refreshMu.Unlock()
@@ -224,11 +212,10 @@ func (a *App) forceRefresh(ctx context.Context) error {
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return fmt.Errorf("parse token response: %w", err)
 	}
-	// 刷新不轮换时无需落盘:重启后 ensureAuth 总是先刷新验证一次。
+	// 未轮换不落盘:重启后 ensureAuth 会先刷新验证一次。
 	return a.applyToken(tr, false, "refreshed")
 }
 
-// errCredInvalid 表示 refresh_token 已被服务端吊销/拒绝,需要重新登录。
 var errCredInvalid = errors.New("refresh_token rejected, re-login required")
 
 // isInvalidGrant 判断 OAuth 错误响应是否为凭证失效(而非瞬时错误)。
@@ -246,8 +233,7 @@ func isInvalidGrant(body []byte) bool {
 	return false
 }
 
-// applyToken 把 token 端点响应写入内存状态;persist 时落盘(登录必然落盘)。
-// action 仅用于日志(如 "refreshed" / "login success")。
+// applyToken 写入 token 状态;persist 或轮换时落盘。
 func (a *App) applyToken(tr tokenResponse, persist bool, action string) error {
 	if tr.AccessToken == "" {
 		return errors.New("token response missing access_token")
@@ -258,13 +244,13 @@ func (a *App) applyToken(tr tokenResponse, persist bool, action string) error {
 	a.accessToken = tr.AccessToken
 	ttl := tr.ExpiresIn
 	if ttl <= 0 {
-		ttl = ttlFallbackSec // 上游没给就保守按 1 小时
+		ttl = ttlFallbackSec
 	}
 	a.expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
 
 	rotated := false
 	if tr.RefreshToken != "" && tr.RefreshToken != a.refreshToken {
-		a.refreshToken = tr.RefreshToken // 轮换:保存新的
+		a.refreshToken = tr.RefreshToken
 		rotated = true
 	}
 	if persist || rotated {
@@ -277,8 +263,7 @@ func (a *App) applyToken(tr tokenResponse, persist bool, action string) error {
 	return nil
 }
 
-// refreshLoop 睡到"过期前 refreshSkewSec 秒"再刷新,不依赖请求。
-// 刷新失败(瞬时或凭证失效)统一返回 false,由 run 走 ensureAuth 重认证;ctx 取消返回 true。
+// refreshLoop 定时在过期前刷新;失败统一返回 false 交回 run 重认证,ctx 取消返回 true。
 func (a *App) refreshLoop(ctx context.Context) (ctxDone bool) {
 	skew := time.Duration(refreshSkewSec) * time.Second
 	for {
@@ -287,7 +272,7 @@ func (a *App) refreshLoop(ctx context.Context) (ctxDone bool) {
 		exp := a.expiresAt
 		a.mu.Unlock()
 		if !ready {
-			return false // 状态异常,交回 run 重新 ensureAuth
+			return false
 		}
 
 		wait := time.Until(exp.Add(-skew))
@@ -309,8 +294,7 @@ func (a *App) refreshLoop(ctx context.Context) (ctxDone bool) {
 	}
 }
 
-// run 是生命周期主循环: 反复 ensureAuth(载入/刷新/必要时登录)直到成功,
-// 然后进入定时刷新;任何刷新失败都回到 ensureAuth,由它决定重新登录还是重试。
+// run 主循环:ensureAuth 成功进入刷新循环,失败退避重试。
 func (a *App) run(ctx context.Context) {
 	for {
 		if err := a.ensureAuth(); err != nil {
@@ -322,18 +306,15 @@ func (a *App) run(ctx context.Context) {
 			continue
 		}
 		if a.refreshLoop(ctx) {
-			return // ctx 取消
+			return
 		}
-		// 刷新失败:等一个退避周期后重新走 ensureAuth
 		if !sleepCtx(ctx, retryDelaySec*time.Second) {
 			return
 		}
 	}
 }
 
-// ensureAuth 保证有可用凭证:
-//  1. 载入凭证文件;成功则刷新一次验证 refresh_token 有效性。
-//  2. 无凭证 / 刷新失败 → 自动 device code 登录。
+// ensureAuth 保证有可用凭证:载入并刷新验证,失败则自动登录。
 func (a *App) ensureAuth() error {
 	if a.loadCred() {
 		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeoutSec*time.Second)
@@ -352,11 +333,11 @@ func (a *App) ensureAuth() error {
 	return a.login(ctx)
 }
 
-// ---------- Device Code 登录 (RFC 8628) ----------
+// ---------- device code 登录 ----------
 
-// login 执行 OAuth2 Device Authorization Grant,成功后写入凭证并更新内存。
+// login 执行 device code 授权并落盘凭证。
 func (a *App) login(ctx context.Context) error {
-	// 1) 请求 device code(带 grok 客户端版本/surface 头)
+	// 请求 device code
 	form := url.Values{}
 	form.Set("client_id", oauthClientID)
 	form.Set("scope", oauthScope)
@@ -373,7 +354,7 @@ func (a *App) login(ctx context.Context) error {
 		return fmt.Errorf("parse device code: %w", err)
 	}
 
-	// 2) 提示用户去浏览器授权
+	// 提示用户去浏览器授权
 	openURL := dc.VerificationURIComplete
 	if openURL == "" {
 		openURL = dc.VerificationURI
@@ -385,7 +366,7 @@ func (a *App) login(ctx context.Context) error {
 	fmt.Printf("========================================================\n\n")
 	tryOpenBrowser(openURL)
 
-	// 3) 轮询 token 端点
+	// 轮询 token 端点
 	interval := dc.Interval
 	if interval <= 0 {
 		interval = devicePollInterval
@@ -413,7 +394,7 @@ func (a *App) login(ctx context.Context) error {
 			return a.applyToken(tr, true, "login success")
 		}
 
-		// 解析 OAuth 标准错误
+		// OAuth 标准错误
 		var e struct {
 			Error string `json:"error"`
 		}
@@ -434,9 +415,8 @@ func (a *App) login(ctx context.Context) error {
 	return errors.New("login timed out")
 }
 
-// oauthFormPost POST 表单到 OAuth 端点,统一带上 grok 客户端头。
-// surface 为 true 时额外带 x-grok-client-surface(cli 登录流程用)。
-// 返回 (HTTP 状态码, 响应体, 网络错误);状态码解释交给调用方。
+// oauthFormPost POST 表单到 OAuth 端点,统一附 grok 客户端头。
+// surface 时额外带 x-grok-client-surface。
 func oauthFormPost(ctx context.Context, endpoint string, form url.Values, surface bool) (int, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
 		strings.NewReader(form.Encode()))
@@ -457,7 +437,7 @@ func oauthFormPost(ctx context.Context, endpoint string, form url.Values, surfac
 	return resp.StatusCode, body, nil
 }
 
-// tryOpenBrowser 尽力自动打开浏览器(失败静默,用户可手动打开)。
+// tryOpenBrowser 打开浏览器,失败静默。
 func tryOpenBrowser(u string) {
 	var cmd string
 	var args []string
@@ -474,7 +454,7 @@ func tryOpenBrowser(u string) {
 
 // ---------- 转发 ----------
 
-// userAgent 模拟 grok-shell 的 UA: grok-shell/<ver> (<os>; <arch>)。
+// userAgent 模拟 grok-shell 的 UA。
 func userAgent() string {
 	osName := runtime.GOOS
 	if osName == "darwin" {
@@ -489,8 +469,7 @@ func userAgent() string {
 	return fmt.Sprintf("grok-shell/%s (%s; %s)", grokClientVersion, osName, arch)
 }
 
-// grokHeaders 构造转发到 cli-chat-proxy 时附加的静态头(与官方 grok CLI 对齐)。
-// 在 main 里 GROK_CLIENT_VERSION 覆盖后调用一次。
+// grokHeaders 构造转发附加的静态头。
 func grokHeaders() map[string]string {
 	return map[string]string{
 		"X-XAI-Token-Auth":         "xai-grok-cli",
@@ -502,17 +481,17 @@ func grokHeaders() map[string]string {
 	}
 }
 
-// buildProxy 创建反向代理: 根路径透传,注入新鲜 Bearer + grok 静态头。
+// buildProxy 构造反向代理。
 func (a *App) buildProxy() {
 	target := upstreamTarget
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			// 只改 scheme/host,路径原样透传(如 /v1/chat/completions)
+			// 路径原样透传,只改 scheme/host
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
 
-			// serve 已保证 ready(access_token 非空),这里只负责注入
+			// serve 已保证 ready(access_token 非空),这里只注入
 			req.Header.Set("Authorization", "Bearer "+a.token())
 			for k, v := range a.headers {
 				req.Header.Set(k, v)
@@ -528,7 +507,6 @@ func (a *App) buildProxy() {
 	a.proxy = rp
 }
 
-// serve 处理代理请求: 未就绪返回 503,就绪则转发。
 func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 	ready, authErr := a.authStatus()
 	if !ready {
@@ -547,14 +525,14 @@ func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 	a.proxy.ServeHTTP(w, r)
 }
 
-// refreshRoundTripper 收到 401 时强制刷新一次并重试(被动兜底)。
+// refreshRoundTripper 收到 401 时强制刷新并重试一次。
 type refreshRoundTripper struct {
 	a    *App
 	base http.RoundTripper
 }
 
 func (rt *refreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// 为可能的重试缓冲请求体(ReverseProxy 转发的 body 没有 GetBody,无法二次构造)
+	// 预缓冲 body:401 重试时需重发
 	var bodyBytes []byte
 	if req.Body != nil {
 		bodyBytes, _ = io.ReadAll(req.Body)
@@ -570,7 +548,6 @@ func (rt *refreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 		return resp, nil
 	}
 
-	// 401:强制刷新后重试一次
 	log.Printf("[%s] got 401, forcing refresh and retrying once", logTag)
 	resp.Body.Close()
 	if err := rt.a.forceRefresh(req.Context()); err != nil {
@@ -586,10 +563,10 @@ func (rt *refreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 
 // ---------- HTTP ----------
 
-// authMiddleware 校验客户端固定 api_key(Authorization: Bearer 或 x-api-key)。
+// authMiddleware 校验固定 api_key(Authorization: Bearer 或 x-api-key)。
 func authMiddleware(want string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if want == "" { // 未配置则不校验
+		if want == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -612,11 +589,8 @@ func authMiddleware(want string, next http.Handler) http.Handler {
 
 // ---------- 主流程 ----------
 
+// 用法: grok-proxy [config.json] [login]
 func main() {
-	// 用法: grok-proxy [config.json] [login]
-	//   grok-proxy              用默认 config.json 启动(后台自动鉴权/登录)
-	//   grok-proxy config.json  指定配置启动
-	//   grok-proxy login        强制重新登录后退出
 	cfgPath := "config.json"
 	forceLogin := false
 	for _, arg := range os.Args[1:] {
@@ -645,7 +619,6 @@ func main() {
 	mux.HandleFunc("/", a.serve)
 
 	if forceLogin {
-		// 强制登录模式: 登录成功后退出
 		ctx, cancel := context.WithTimeout(context.Background(), loginTimeout)
 		defer cancel()
 		if err := a.login(ctx); err != nil {
@@ -697,7 +670,7 @@ func truncate(s string, n int) string {
 	return s
 }
 
-// formatTime 按系统本地时区输出 RFC3339(如 +08:00),避免日志里一律是 UTC 的 Z。
+// formatTime 按本地时区输出 RFC3339。
 func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -711,7 +684,7 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// sleepCtx 睡眠 d,期间 ctx 取消则立即返回 false。
+// sleepCtx 睡眠 d;ctx 取消返回 false。
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	select {
 	case <-ctx.Done():

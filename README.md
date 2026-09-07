@@ -1,13 +1,11 @@
 # grok-proxy
 
-一个面向 **grok** 的极简 OAuth2 反向代理。客户端只用一个固定的 `api_key`,
-代理自己维护 grok 的 OAuth2 token —— 首次自动 device-code 登录,之后过期前自动刷新、
-处理 token 轮换、落盘持久化,转发时自动带上 grok 官方 CLI 同款的请求头。
-
-**与通用 oauth-proxy 不同**:grok 相关的 URL、client_id、scope、请求头全部内置写死,
+一个面向 **grok** 的极简 OAuth2 反向代理:客户端只用一个固定 `api_key`,
+代理自动维护 grok 的 token(首次 device-code 登录、过期前自动刷新、轮换落盘),
+并把请求转发到 cli-chat-proxy。URL、client_id、scope、请求头全部内置,
 config.json 只有 3 个字段。零第三方依赖(纯 Go 标准库)。
 
-## config.json(就这么多)
+## config.json
 
 ```json
 {
@@ -23,16 +21,9 @@ config.json 只有 3 个字段。零第三方依赖(纯 Go 标准库)。
 | `api_key` | 客户端访问本代理的固定 key(空则不校验) | — |
 | `cred_file` | 凭证文件路径(支持 `~`) | `grok-auth.json` |
 
-其余参数(上游 URL、OAuth 端点、client_id、scope、`skew_sec=300`、超时、请求头)
-全部内置,与官方 grok CLI 对齐;客户端版本可用环境变量 `GROK_CLIENT_VERSION` 覆盖。
+客户端版本用环境变量 `GROK_CLIENT_VERSION` 覆盖;上游更新后同步 `main.go` 顶部常量。
 
-> 内置参数可以这样看:
-> 上游 `https://cli-chat-proxy.grok.com`,OAuth `auth.x.ai`,
-> client_id `b1a00492-...`,请求头带 `x-grok-client-version` / `X-XAI-Token-Auth`
-> 等,grok CLI 更新后如需同步改 `main.go` 顶部的常量即可。
-
-路由为根路径 `/`:**所有路径原样透传到上游**——直接按 OpenAI 兼容格式调用,
-不需要 `/grok` 之类的前缀。
+路由为根路径 `/`:所有路径原样透传上游,直接按 OpenAI 兼容格式调用。
 
 ## 运行
 
@@ -86,9 +77,3 @@ curl -X POST http://127.0.0.1:5001/v1/chat/completions \
   api_key: sk-local-fixed
   base_url: http://127.0.0.1:5001/v1
 ```
-
-## 从 oauth-proxy 迁移
-
-凭证格式完全兼容:直接复用原 `cred_file`(如 `/data/grok-auth.json`)即可,
-`config.json` 里删掉不用的字段(upstreams、name、cred_dir、token_url、client_id 等),
-`client_api_key` 改名为 `api_key`。
