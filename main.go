@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -31,28 +32,47 @@ import (
 	"time"
 )
 
-// ---------- grok 内置常量(与官方 grok-build 对齐,一般不用改) ----------
+// ---------- grok 内置参数(与官方 grok-build 对齐,一般不用改) ----------
 
 const (
+	logTag      = "grok" // 日志标签 + 路由前缀
+	routePrefix = "/grok"
+
 	upstreamBase  = "https://cli-chat-proxy.grok.com"      // 上游 API
 	oauthTokenURL = "https://auth.x.ai/oauth2/token"       // token 端点(刷新/轮询)
 	oauthDevURL   = "https://auth.x.ai/oauth2/device/code" // device code 端点
 	oauthClientID = "b1a00492-073a-47ea-816f-4c329264a828"
 	oauthScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 	oauthReferrer = "grok-build"
+
 	// grok CLI 版本号,请求头会带它。可用环境变量 GROK_CLIENT_VERSION 覆盖。
 	defaultClientVersion = "1.0.13"
-	refreshSkewSec       = 300 // 过期前多少秒提前刷新
-	oauthHTTPTimeoutSec  = 60  // OAuth 请求(刷新/轮询)单次超时
-	devicePollInterval   = 5   // device code 轮询间隔(秒)
+
+	defaultListen   = ":8080"
+	defaultCredFile = "grok-auth.json"
+
+	refreshSkewSec      = 300 // 过期前多少秒提前刷新
+	refreshTimeoutSec   = 30  // 单次刷新请求的超时
+	retryDelaySec       = 60  // 鉴权失败后的重试间隔
+	oauthHTTPTimeoutSec = 60  // OAuth 单次请求超时
+	devicePollInterval  = 5   // device code 轮询间隔(秒)
+	ttlFallbackSec      = 3600
+	loginTimeout        = 10 * time.Minute
 )
 
 // grokClientVersion 是发到上游的 x-grok-client-version 值。
 var grokClientVersion = defaultClientVersion
 
-// ---------- 配置 ----------
+// upstreamTarget 是编译期常量 URL 的解析结果(不可能失败)。
+var upstreamTarget = func() *url.URL {
+	u, err := url.Parse(upstreamBase)
+	if err != nil {
+		panic("bad upstreamBase: " + err.Error())
+	}
+	return u
+}()
 
-const defaultName = "grok" // 路由前缀 /grok/... 与日志标签(不需要配置)
+// ---------- 配置 ----------
 
 type Config struct {
 	Listen   string `json:"listen"`    // 监听地址,默认 ":8080"
@@ -62,11 +82,11 @@ type Config struct {
 
 // App 是单个 grok 上游的全部运行时状态。
 type App struct {
-	cfg      *Config
-	name     string // 固定 defaultName,用于路由与日志
 	credPath string
+	headers  map[string]string // 转发时附加的静态头(启动时构造一次)
 	proxy    *httputil.ReverseProxy
 
+	refreshMu    sync.Mutex // 串行化刷新:refresh_token 不能并发使用
 	mu           sync.Mutex
 	accessToken  string
 	refreshToken string
@@ -82,13 +102,11 @@ type credFileData struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
-// tokenResponse 是 OAuth token 端点标准响应。
+// tokenResponse 是 OAuth token 端点标准响应(未用的字段交给 json 忽略)。
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"` // 若返回则说明轮换
-	Scope        string `json:"scope"`
 }
 
 // deviceCodeResponse 是 device code 端点响应。
@@ -106,18 +124,19 @@ var oauthHTTPClient = &http.Client{Timeout: oauthHTTPTimeoutSec * time.Second}
 
 // ---------- 凭证读写 ----------
 
-// resolveCredPath 返回凭证路径:配置的 cred_file,缺省 "grok-auth.json"。
-func (a *App) resolveCredPath() {
-	p := a.cfg.CredFile
+// credPath 返回凭证文件路径:配置的 cred_file,缺省 "grok-auth.json"。
+func credPath(credFile string) string {
+	p := credFile
 	if p == "" {
-		p = "grok-auth.json"
+		p = defaultCredFile
 	}
-	a.credPath = expandHome(p)
-	if dir := filepath.Dir(a.credPath); dir != "." {
+	p = expandHome(p)
+	if dir := filepath.Dir(p); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Printf("[%s] warn: mkdir cred dir: %v", a.name, err)
+			log.Printf("[%s] warn: mkdir cred dir: %v", logTag, err)
 		}
 	}
+	return p
 }
 
 // loadCred 从凭证文件载入 access/refresh/expiry。返回是否成功载入。
@@ -135,11 +154,11 @@ func (a *App) loadCred() bool {
 	a.accessToken = c.AccessToken
 	a.expiresAt = c.ExpiresAt
 	a.mu.Unlock()
-	log.Printf("[%s] loaded cred from %s (expires %s)", a.name, a.credPath, formatTime(c.ExpiresAt))
+	log.Printf("[%s] loaded cred from %s (expires %s)", logTag, a.credPath, formatTime(c.ExpiresAt))
 	return true
 }
 
-// saveCred 把当前凭证写回文件(轮换后必须持久化)。调用者须持有 a.mu。
+// saveCred 把当前凭证写回文件(轮换/登录后必须持久化)。调用者须持有 a.mu。
 func (a *App) saveCred() {
 	data, _ := json.MarshalIndent(credFileData{
 		AccessToken:  a.accessToken,
@@ -147,7 +166,7 @@ func (a *App) saveCred() {
 		ExpiresAt:    a.expiresAt,
 	}, "", "  ")
 	if err := os.WriteFile(a.credPath, data, 0o600); err != nil {
-		log.Printf("[%s] warn: save cred failed: %v", a.name, err)
+		log.Printf("[%s] warn: save cred failed: %v", logTag, err)
 	}
 }
 
@@ -159,18 +178,11 @@ func (a *App) token() string {
 	return a.accessToken
 }
 
-// isReady 返回是否已拿到可用 token。
-func (a *App) isReady() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.ready && a.accessToken != ""
-}
-
-// authStatus 返回 (ready, errMsg)。
+// authStatus 返回 (ready, errMsg)。ready 只由 applyToken 置真,且与 access_token 同锁写入。
 func (a *App) authStatus() (bool, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.ready && a.accessToken != "", a.authErr
+	return a.ready, a.authErr
 }
 
 func (a *App) setAuthErr(msg string) {
@@ -180,54 +192,74 @@ func (a *App) setAuthErr(msg string) {
 	a.mu.Unlock()
 }
 
-// forceRefresh 无条件刷新一次(启动验证 / 401 兜底)。
+// forceRefresh 无条件刷新一次(启动验证 / 定时 / 401 兜底共用)。
+// 网络/5xx 等瞬时失败返回普通错误;refresh_token 被服务端拒绝返回 errCredInvalid。
 func (a *App) forceRefresh(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.refreshLocked(ctx)
-}
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
 
-// refreshLocked 执行标准 OAuth2 refresh_token 刷新。调用者须持有 a.mu。
-func (a *App) refreshLocked(ctx context.Context) error {
-	if a.refreshToken == "" {
-		return fmt.Errorf("no refresh_token available")
+	a.mu.Lock()
+	rt := a.refreshToken
+	a.mu.Unlock()
+	if rt == "" {
+		return errors.New("no refresh_token available")
 	}
+
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", a.refreshToken)
+	form.Set("refresh_token", rt)
 	form.Set("client_id", oauthClientID)
 	form.Set("scope", oauthScope)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL,
-		strings.NewReader(form.Encode()))
+	status, body, err := oauthFormPost(ctx, oauthTokenURL, form, false)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("x-grok-client-version", grokClientVersion)
-
-	resp, err := oauthHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("refresh request: %w", err)
+	if status == http.StatusBadRequest && isInvalidGrant(body) {
+		return errCredInvalid
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("refresh failed HTTP %d: %s", resp.StatusCode, truncate(string(body), 300))
+	if status != http.StatusOK {
+		return fmt.Errorf("refresh failed HTTP %d: %s", status, truncate(string(body), 300))
 	}
-
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return fmt.Errorf("parse token response: %w", err)
 	}
-	if tr.AccessToken == "" {
-		return fmt.Errorf("token response missing access_token")
+	// 刷新不轮换时无需落盘:重启后 ensureAuth 总是先刷新验证一次。
+	return a.applyToken(tr, false, "refreshed")
+}
+
+// errCredInvalid 表示 refresh_token 已被服务端吊销/拒绝,需要重新登录。
+var errCredInvalid = errors.New("refresh_token rejected, re-login required")
+
+// isInvalidGrant 判断 OAuth 错误响应是否为凭证失效(而非瞬时错误)。
+func isInvalidGrant(body []byte) bool {
+	var e struct {
+		Error string `json:"error"`
 	}
+	if json.Unmarshal(body, &e) != nil {
+		return false
+	}
+	switch e.Error {
+	case "invalid_grant", "invalid_client", "expired_token":
+		return true
+	}
+	return false
+}
+
+// applyToken 把 token 端点响应写入内存状态;persist 时落盘(登录必然落盘)。
+// action 仅用于日志(如 "refreshed" / "login success")。
+func (a *App) applyToken(tr tokenResponse, persist bool, action string) error {
+	if tr.AccessToken == "" {
+		return errors.New("token response missing access_token")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	a.accessToken = tr.AccessToken
 	ttl := tr.ExpiresIn
 	if ttl <= 0 {
-		ttl = 3600 // 上游没给就保守按 1 小时
+		ttl = ttlFallbackSec // 上游没给就保守按 1 小时
 	}
 	a.expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
 
@@ -236,73 +268,67 @@ func (a *App) refreshLocked(ctx context.Context) error {
 		a.refreshToken = tr.RefreshToken // 轮换:保存新的
 		rotated = true
 	}
+	if persist || rotated {
+		a.saveCred()
+	}
 	a.ready = true
 	a.authErr = ""
-	a.saveCred()
-	log.Printf("[%s] refreshed; expires %s (rotated_refresh_token=%v)",
-		a.name, formatTime(a.expiresAt), rotated)
+	log.Printf("[%s] %s; expires %s (rotated_refresh_token=%v)",
+		logTag, action, formatTime(a.expiresAt), rotated)
 	return nil
 }
 
-// autoRefreshLoop 后台定时刷新: 睡到"过期前 300s"再刷新,不依赖请求。
-func (a *App) autoRefreshLoop(ctx context.Context) {
-	skew := refreshSkewSec * time.Second
+// refreshLoop 睡到"过期前 refreshSkewSec 秒"再刷新,不依赖请求。
+// 刷新失败(瞬时或凭证失效)统一返回 false,由 run 走 ensureAuth 重认证;ctx 取消返回 true。
+func (a *App) refreshLoop(ctx context.Context) (ctxDone bool) {
+	skew := time.Duration(refreshSkewSec) * time.Second
 	for {
 		a.mu.Lock()
 		ready := a.ready
 		exp := a.expiresAt
 		a.mu.Unlock()
-
 		if !ready {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(5 * time.Second):
-			}
-			continue
+			return false // 状态异常,交回 run 重新 ensureAuth
 		}
 
 		wait := time.Until(exp.Add(-skew))
 		if wait < time.Second {
 			wait = time.Second // 已到期/临近,尽快刷新(但避免忙等)
 		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(wait):
+		if !sleepCtx(ctx, wait) {
+			return true
 		}
 
-		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		rctx, cancel := context.WithTimeout(ctx, refreshTimeoutSec*time.Second)
 		err := a.forceRefresh(rctx)
 		cancel()
 		if err != nil {
-			log.Printf("[%s] auto-refresh failed, retry in 60s: %v", a.name, err)
+			log.Printf("[%s] auto-refresh failed: %v", logTag, err)
 			a.setAuthErr(err.Error())
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(60 * time.Second):
-			}
+			return false
 		}
 	}
 }
 
-// run 是生命周期: 先保证有可用凭证,再进入定时刷新循环。
+// run 是生命周期主循环: 反复 ensureAuth(载入/刷新/必要时登录)直到成功,
+// 然后进入定时刷新;任何刷新失败都回到 ensureAuth,由它决定重新登录还是重试。
 func (a *App) run(ctx context.Context) {
 	for {
 		if err := a.ensureAuth(); err != nil {
-			log.Printf("[%s] auth failed: %v (retry in 60s)", a.name, err)
+			log.Printf("[%s] auth failed: %v (retry in %ds)", logTag, err, retryDelaySec)
 			a.setAuthErr(err.Error())
-			select {
-			case <-ctx.Done():
+			if !sleepCtx(ctx, retryDelaySec*time.Second) {
 				return
-			case <-time.After(60 * time.Second):
 			}
 			continue
 		}
-		a.autoRefreshLoop(ctx)
-		return
+		if a.refreshLoop(ctx) {
+			return // ctx 取消
+		}
+		// 刷新失败:等一个退避周期后重新走 ensureAuth
+		if !sleepCtx(ctx, retryDelaySec*time.Second) {
+			return
+		}
 	}
 }
 
@@ -311,20 +337,20 @@ func (a *App) run(ctx context.Context) {
 //  2. 无凭证 / 刷新失败 → 自动 device code 登录。
 func (a *App) ensureAuth() error {
 	if a.loadCred() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeoutSec*time.Second)
 		err := a.forceRefresh(ctx)
 		cancel()
 		if err == nil {
 			return nil
 		}
-		log.Printf("[%s] stored credential invalid/expired, re-login required", a.name)
+		log.Printf("[%s] stored credential invalid/expired, re-login required", logTag)
 	} else {
-		log.Printf("[%s] no credential found, login required", a.name)
+		log.Printf("[%s] no credential found, login required", logTag)
 	}
 
-	loginCtx, loginCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer loginCancel()
-	return a.login(loginCtx)
+	ctx, cancel := context.WithTimeout(context.Background(), loginTimeout)
+	defer cancel()
+	return a.login(ctx)
 }
 
 // ---------- Device Code 登录 (RFC 8628) ----------
@@ -336,22 +362,12 @@ func (a *App) login(ctx context.Context) error {
 	form.Set("client_id", oauthClientID)
 	form.Set("scope", oauthScope)
 	form.Set("referrer", oauthReferrer)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthDevURL,
-		strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("x-grok-client-version", grokClientVersion)
-	req.Header.Set("x-grok-client-surface", "cli")
-	resp, err := oauthHTTPClient.Do(req)
+	status, body, err := oauthFormPost(ctx, oauthDevURL, form, true)
 	if err != nil {
 		return fmt.Errorf("device code request: %w", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("device code failed HTTP %d: %s", resp.StatusCode, truncate(string(body), 300))
+	if status != http.StatusOK {
+		return fmt.Errorf("device code failed HTTP %d: %s", status, truncate(string(body), 300))
 	}
 	var dc deviceCodeResponse
 	if err := json.Unmarshal(body, &dc); err != nil {
@@ -364,7 +380,7 @@ func (a *App) login(ctx context.Context) error {
 		openURL = dc.VerificationURI
 	}
 	fmt.Printf("\n========================================================\n")
-	fmt.Printf("  [%s] 需要登录。请在浏览器中打开以下地址完成授权:\n\n", a.name)
+	fmt.Printf("  [%s] 需要登录。请在浏览器中打开以下地址完成授权:\n\n", logTag)
 	fmt.Printf("    %s\n\n", openURL)
 	fmt.Printf("  如未自动打开,请手动访问;user_code: %s\n", dc.UserCode)
 	fmt.Printf("========================================================\n\n")
@@ -377,51 +393,25 @@ func (a *App) login(ctx context.Context) error {
 	}
 	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
 	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
+		if !sleepCtx(ctx, time.Duration(interval)*time.Second) {
 			return ctx.Err()
-		case <-time.After(time.Duration(interval) * time.Second):
 		}
 
 		pf := url.Values{}
 		pf.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 		pf.Set("device_code", dc.DeviceCode)
 		pf.Set("client_id", oauthClientID)
-		preq, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL,
-			strings.NewReader(pf.Encode()))
+		status, pbody, err := oauthFormPost(ctx, oauthTokenURL, pf, true)
 		if err != nil {
-			return err
-		}
-		preq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		preq.Header.Set("x-grok-client-version", grokClientVersion)
-		preq.Header.Set("x-grok-client-surface", "cli")
-		presp, err := oauthHTTPClient.Do(preq)
-		if err != nil {
-			log.Printf("[%s] poll error (will retry): %v", a.name, err)
+			log.Printf("[%s] poll error (will retry): %v", logTag, err)
 			continue
 		}
-		pbody, _ := io.ReadAll(presp.Body)
-		presp.Body.Close()
-
-		if presp.StatusCode == http.StatusOK {
+		if status == http.StatusOK {
 			var tr tokenResponse
 			if err := json.Unmarshal(pbody, &tr); err != nil {
 				return fmt.Errorf("parse token: %w", err)
 			}
-			a.mu.Lock()
-			a.accessToken = tr.AccessToken
-			a.refreshToken = tr.RefreshToken
-			ttl := tr.ExpiresIn
-			if ttl <= 0 {
-				ttl = 3600
-			}
-			a.expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
-			a.ready = true
-			a.authErr = ""
-			a.saveCred()
-			a.mu.Unlock()
-			log.Printf("[%s] login success; cred saved to %s", a.name, a.credPath)
-			return nil
+			return a.applyToken(tr, true, "login success")
 		}
 
 		// 解析 OAuth 标准错误
@@ -435,14 +425,37 @@ func (a *App) login(ctx context.Context) error {
 		case "slow_down":
 			interval += 5
 		case "access_denied":
-			return fmt.Errorf("login denied by user")
+			return errors.New("login denied by user")
 		case "expired_token":
-			return fmt.Errorf("device code expired, please retry")
+			return errors.New("device code expired, please retry")
 		default:
-			log.Printf("[%s] poll HTTP %d: %s", a.name, presp.StatusCode, truncate(string(pbody), 200))
+			log.Printf("[%s] poll HTTP %d: %s", logTag, status, truncate(string(pbody), 200))
 		}
 	}
-	return fmt.Errorf("login timed out")
+	return errors.New("login timed out")
+}
+
+// oauthFormPost POST 表单到 OAuth 端点,统一带上 grok 客户端头。
+// surface 为 true 时额外带 x-grok-client-surface(cli 登录流程用)。
+// 返回 (HTTP 状态码, 响应体, 网络错误);状态码解释交给调用方。
+func oauthFormPost(ctx context.Context, endpoint string, form url.Values, surface bool) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("x-grok-client-version", grokClientVersion)
+	if surface {
+		req.Header.Set("x-grok-client-surface", "cli")
+	}
+	resp, err := oauthHTTPClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, nil
 }
 
 // tryOpenBrowser 尽力自动打开浏览器(失败静默,用户可手动打开)。
@@ -462,47 +475,6 @@ func tryOpenBrowser(u string) {
 
 // ---------- 转发 ----------
 
-// buildProxy 创建反向代理: 注入新鲜 Bearer + grok 请求头。
-func (a *App) buildProxy() error {
-	target, err := url.Parse(upstreamBase)
-	if err != nil {
-		return fmt.Errorf("bad base_url: %w", err)
-	}
-	prefix := "/" + a.name
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			path := strings.TrimPrefix(req.URL.Path, prefix)
-			req.URL.Path = strings.TrimRight(target.Path, "/") + path
-			req.Host = target.Host
-
-			tok := a.token()
-			if tok == "" {
-				// 无可用 token,用 header 标记,Transport 里拦截
-				req.Header.Set("X-OAuthProxy-Error", "no access token available")
-				return
-			}
-			req.Header.Set("Authorization", "Bearer "+tok)
-			// 与官方 grok CLI 对齐的请求头(version 可被 GROK_CLIENT_VERSION 覆盖)
-			req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
-			req.Header.Set("x-authenticateresponse", "authenticate-response")
-			req.Header.Set("x-grok-client-version", grokClientVersion)
-			req.Header.Set("x-grok-client-identifier", "grok-shell")
-			req.Header.Set("x-grok-client-mode", "interactive")
-			req.Header.Set("User-Agent", userAgent())
-		},
-		Transport:     &refreshRoundTripper{a: a, base: http.DefaultTransport},
-		FlushInterval: -1, // 立即 flush,支持 SSE 流式
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[%s] proxy error: %v", a.name, err)
-			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
-		},
-	}
-	a.proxy = rp
-	return nil
-}
-
 // userAgent 模拟 grok-shell 的 UA: grok-shell/<ver> (<os>; <arch>)。
 func userAgent() string {
 	osName := runtime.GOOS
@@ -518,7 +490,46 @@ func userAgent() string {
 	return fmt.Sprintf("grok-shell/%s (%s; %s)", grokClientVersion, osName, arch)
 }
 
-// serve 处理该上游的请求: 未就绪返回 503,就绪则转发。
+// grokHeaders 构造转发到 cli-chat-proxy 时附加的静态头(与官方 grok CLI 对齐)。
+// 在 main 里 GROK_CLIENT_VERSION 覆盖后调用一次。
+func grokHeaders() map[string]string {
+	return map[string]string{
+		"X-XAI-Token-Auth":         "xai-grok-cli",
+		"x-authenticateresponse":   "authenticate-response",
+		"x-grok-client-version":    grokClientVersion,
+		"x-grok-client-identifier": "grok-shell",
+		"x-grok-client-mode":       "interactive",
+		"User-Agent":               userAgent(),
+	}
+}
+
+// buildProxy 创建反向代理: 注入新鲜 Bearer + grok 静态头。
+func (a *App) buildProxy() {
+	target := upstreamTarget
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, routePrefix)
+			req.Host = target.Host
+
+			// serve 已保证 ready(access_token 非空),这里只负责注入
+			req.Header.Set("Authorization", "Bearer "+a.token())
+			for k, v := range a.headers {
+				req.Header.Set(k, v)
+			}
+		},
+		Transport:     &refreshRoundTripper{a: a, base: http.DefaultTransport},
+		FlushInterval: -1, // 立即 flush,支持 SSE 流式
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[%s] proxy error: %v", logTag, err)
+			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		},
+	}
+	a.proxy = rp
+}
+
+// serve 处理 /grok/... 请求: 未就绪返回 503,就绪则转发。
 func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 	ready, authErr := a.authStatus()
 	if !ready {
@@ -544,11 +555,7 @@ type refreshRoundTripper struct {
 }
 
 func (rt *refreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if e := req.Header.Get("X-OAuthProxy-Error"); e != "" {
-		return nil, fmt.Errorf("token error: %s", e)
-	}
-
-	// 为可能的重试缓冲请求体
+	// 为可能的重试缓冲请求体(ReverseProxy 转发的 body 没有 GetBody,无法二次构造)
 	var bodyBytes []byte
 	if req.Body != nil {
 		bodyBytes, _ = io.ReadAll(req.Body)
@@ -565,17 +572,13 @@ func (rt *refreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	}
 
 	// 401:强制刷新后重试一次
-	log.Printf("[%s] got 401, forcing refresh and retrying once", rt.a.name)
+	log.Printf("[%s] got 401, forcing refresh and retrying once", logTag)
 	resp.Body.Close()
 	if err := rt.a.forceRefresh(req.Context()); err != nil {
 		rt.a.setAuthErr(err.Error())
 		return nil, fmt.Errorf("forced refresh after 401 failed: %w", err)
 	}
-	tok := rt.a.token()
-	if tok == "" {
-		return nil, fmt.Errorf("no access token after refresh")
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Authorization", "Bearer "+rt.a.token())
 	if bodyBytes != nil {
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
@@ -601,7 +604,12 @@ func authMiddleware(want string, next http.Handler) http.Handler {
 			got = r.Header.Get("x-api-key")
 		}
 		if got != want {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "unauthorized",
+					"type":    "invalid_api_key",
+				},
+			})
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -633,16 +641,16 @@ func main() {
 		grokClientVersion = v
 	}
 
-	a := &App{cfg: cfg, name: defaultName}
-	a.resolveCredPath()
-	if err := a.buildProxy(); err != nil {
-		log.Fatalf("%v", err)
+	a := &App{
+		credPath: credPath(cfg.CredFile),
+		headers:  grokHeaders(),
 	}
+	a.buildProxy()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		ready, authErr := a.authStatus()
-		status := map[string]interface{}{"name": a.name, "ready": ready}
+		status := map[string]interface{}{"ready": ready}
 		if authErr != "" {
 			status["error"] = authErr
 		}
@@ -650,30 +658,28 @@ func main() {
 		if !ready {
 			code = http.StatusServiceUnavailable
 		}
-		writeJSON(w, code, map[string]interface{}{"ok": ready, "grok": status})
+		writeJSON(w, code, map[string]interface{}{"ok": ready, logTag: status})
 	})
-	mux.HandleFunc("/"+a.name+"/", func(w http.ResponseWriter, r *http.Request) {
-		a.serve(w, r)
-	})
+	mux.HandleFunc(routePrefix+"/", a.serve)
 
 	if forceLogin {
 		// 强制登录模式: 登录成功后退出
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), loginTimeout)
 		defer cancel()
 		if err := a.login(ctx); err != nil {
 			log.Fatalf("login failed: %v", err)
 		}
-		log.Printf("[%s] logged in, cred at %s", a.name, a.credPath)
+		log.Printf("[%s] logged in, cred at %s", logTag, a.credPath)
 		return
 	}
 
 	handler := authMiddleware(cfg.APIKey, mux)
 	listen := cfg.Listen
 	if listen == "" {
-		listen = ":8080"
+		listen = defaultListen
 	}
-	log.Printf("grok-proxy %s listening on %s; route /%s/ -> %s (auth runs in background)",
-		grokClientVersion, listen, a.name, upstreamBase)
+	log.Printf("grok-proxy listening on %s; route %s/ -> %s (grok client v%s, auth in background)",
+		listen, routePrefix, upstreamBase, grokClientVersion)
 	go a.run(context.Background())
 	log.Fatal(http.ListenAndServe(listen, handler))
 }
@@ -721,4 +727,14 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// sleepCtx 睡眠 d,期间 ctx 取消则立即返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
