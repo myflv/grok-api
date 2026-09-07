@@ -587,13 +587,8 @@ func (rt *refreshRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // ---------- HTTP ----------
 
 // authMiddleware 校验客户端固定 api_key(Authorization: Bearer 或 x-api-key)。
-// /healthz 不需要鉴权。
 func authMiddleware(want string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
-			next.ServeHTTP(w, r)
-			return
-		}
 		if want == "" { // 未配置则不校验
 			next.ServeHTTP(w, r)
 			return
@@ -647,18 +642,6 @@ func main() {
 	a.buildProxy()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		ready, authErr := a.authStatus()
-		status := map[string]interface{}{"ready": ready}
-		if authErr != "" {
-			status["error"] = authErr
-		}
-		code := http.StatusOK
-		if !ready {
-			code = http.StatusServiceUnavailable
-		}
-		writeJSON(w, code, map[string]interface{}{"ok": ready, logTag: status})
-	})
 	mux.HandleFunc("/", a.serve)
 
 	if forceLogin {
