@@ -1,0 +1,13 @@
+# 凭证文件(登录产生,含 access/refresh token,禁止提交)
+/data/
+*-auth.json
+auth.json
+grok.json
+
+# 编译产物
+/grok-proxy
+/grok-proxy.exe
+*.exe
+
+# 临时文件
+*.log
